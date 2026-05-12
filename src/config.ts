@@ -87,6 +87,14 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
       maxTokens,
     };
   }
+  if (hasRealValue(env["OPENAI_API_KEY"]) && hasRealValue(env["OPENAI_BASE_URL"])) {
+    return {
+      provider: "openai",
+      model: env["OPENAI_LLM_MODEL"] || "qwen2.5:3b-instruct",
+      maxTokens,
+      baseURL: env["OPENAI_BASE_URL"],
+    };
+  }
 
   const allowAgentSdk = env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true";
   if (!allowAgentSdk) {
@@ -156,7 +164,8 @@ export function detectLlmProviderKind(): "llm" | "noop" {
     hasRealValue(env["GEMINI_API_KEY"]) ||
     hasRealValue(env["GOOGLE_API_KEY"]) ||
     hasRealValue(env["OPENROUTER_API_KEY"]) ||
-    hasRealValue(env["MINIMAX_API_KEY"])
+    hasRealValue(env["MINIMAX_API_KEY"]) ||
+    (hasRealValue(env["OPENAI_API_KEY"]) && hasRealValue(env["OPENAI_BASE_URL"]))
   ) {
     return "llm";
   }
@@ -292,6 +301,7 @@ const VALID_PROVIDERS = new Set([
   "openrouter",
   "agent-sdk",
   "minimax",
+  "openai",
 ]);
 
 export function loadFallbackConfig(): FallbackConfig {

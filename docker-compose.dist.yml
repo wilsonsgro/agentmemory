@@ -2,7 +2,7 @@ services:
 
   ollama-memoryagent:
       build:
-        context: .
+        context: ..
         dockerfile: ollama-memoryagent/Dockerfile
       container_name: ollama-memoryagent
       restart: unless-stopped
@@ -16,7 +16,7 @@ services:
           - "11435:11435"
       volumes:
           - ollama-memoryagent:/root/.ollama
-          - ./src/ollama-memoryagent:/docker-entrypoint-init.d:ro
+          - ../src/ollama-memoryagent:/docker-entrypoint-init.d:ro
       deploy:
           resources:
               reservations:

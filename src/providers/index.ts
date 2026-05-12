@@ -94,6 +94,15 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
         config.maxTokens,
         "https://openrouter.ai/api/v1/chat/completions",
       );
+    case "openai": {
+      const baseURL = config.baseURL || requireEnvVar("OPENAI_BASE_URL");
+      return new OpenRouterProvider(
+        requireEnvVar("OPENAI_API_KEY"),
+        config.model,
+        config.maxTokens,
+        `${baseURL.replace(/\/$/, "")}/v1/chat/completions`,
+      );
+    }
     case "noop":
       return new NoopProvider();
     case "agent-sdk":

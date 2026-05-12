@@ -26,29 +26,39 @@ function parseGraphXml(
   const edges: GraphEdge[] = [];
   const now = new Date().toISOString();
 
-  const entityRegex =
+  // Match both full tags <entity ...>...</entity> and self-closing <entity .../>
+  const selfClosingRegex =
+    /<entity\s+type="([^"]+)"\s+name="([^"]+)"[^>]*\/>/g;
+  const fullTagRegex =
     /<entity\s+type="([^"]+)"\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/entity>/g;
   let match;
-  while ((match = entityRegex.exec(xml)) !== null) {
-    const type = match[1] as GraphNode["type"];
-    const name = match[2];
-    const propsBlock = match[3];
-    const properties: Record<string, string> = {};
 
+  const seen = new Set<string>();
+  const addNode = (type: string, name: string, propsBlock: string) => {
+    const key = `${type}|${name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;
     let propMatch;
     while ((propMatch = propRegex.exec(propsBlock)) !== null) {
       properties[propMatch[1]] = propMatch[2];
     }
-
     nodes.push({
       id: generateId("gn"),
-      type,
+      type: type as GraphNode["type"],
       name,
       properties,
       sourceObservationIds: observationIds,
       createdAt: now,
     });
+  };
+
+  while ((match = selfClosingRegex.exec(xml)) !== null) {
+    addNode(match[1], match[2], "");
+  }
+  while ((match = fullTagRegex.exec(xml)) !== null) {
+    addNode(match[1], match[2], match[3]);
   }
 
   const relRegex =
