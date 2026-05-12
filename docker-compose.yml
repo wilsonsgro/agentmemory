@@ -44,6 +44,7 @@ services:
     # Override per-shell or via .env file:
     #   AGENTMEMORY_III_VERSION=0.11.7 docker compose up
     image: iiidev/iii:${AGENTMEMORY_III_VERSION:-0.11.2}
+    user: root
     ports:
       - "49134:49134"
       - "3111:3111"
