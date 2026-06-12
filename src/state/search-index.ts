@@ -1,6 +1,7 @@
 import type { CompressedObservation } from "../types.js";
 import { stem } from "./stemmer.js";
 import { getSynonyms } from "./synonyms.js";
+import { segmentCjk, hasCjk } from "./cjk-segmenter.js";
 
 interface IndexEntry {
   obsId: string;
@@ -48,6 +49,29 @@ export class SearchIndex {
 
   has(id: string): boolean {
     return this.entries.has(id);
+  }
+
+  remove(id: string): void {
+    const entry = this.entries.get(id);
+    if (!entry) return;
+
+    const termFreq = this.docTermCounts.get(id);
+    if (termFreq) {
+      for (const term of termFreq.keys()) {
+        const postingList = this.invertedIndex.get(term);
+        if (postingList) {
+          postingList.delete(id);
+          if (postingList.size === 0) {
+            this.invertedIndex.delete(term);
+          }
+        }
+      }
+      this.docTermCounts.delete(id);
+    }
+
+    this.totalDocLength = Math.max(0, this.totalDocLength - entry.termCount);
+    this.entries.delete(id);
+    this.sortedTerms = null;
   }
 
   search(
@@ -222,11 +246,19 @@ export class SearchIndex {
   }
 
   private tokenize(text: string): string[] {
-    return text
-      .replace(/[^\w\s/.\-_]/g, " ")
-      .split(/\s+/)
-      .filter((t) => t.length > 1)
-      .map((t) => stem(t));
+    const cleaned = text.replace(/[^\p{L}\p{N}\s/.\\-_]/gu, " ");
+    const out: string[] = [];
+    for (const raw of cleaned.split(/\s+/)) {
+      if (raw.length < 2) continue;
+      if (hasCjk(raw)) {
+        for (const seg of segmentCjk(raw)) {
+          if (seg.length >= 1) out.push(seg);
+        }
+      } else {
+        out.push(stem(raw));
+      }
+    }
+    return out;
   }
 
   private getSortedTerms(): string[] {

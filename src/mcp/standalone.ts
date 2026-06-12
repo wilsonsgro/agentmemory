@@ -2,7 +2,7 @@
 
 import { InMemoryKV } from "./in-memory-kv.js";
 import { createStdioTransport } from "./transport.js";
-import { getVisibleTools } from "./tools-registry.js";
+import { getAllTools } from "./tools-registry.js";
 import { getStandalonePersistPath } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
@@ -32,6 +32,17 @@ const SERVER_INFO = {
 const kv = new InMemoryKV(getStandalonePersistPath());
 let modeAnnounced = false;
 
+function displayAgentmemoryUrl(): string {
+  // Match the literal-placeholder guard in rest-proxy.ts so log lines
+  // don't show `${AGENTMEMORY_URL}` when an MCP host passed the
+  // placeholder through unexpanded.
+  const raw = process.env["AGENTMEMORY_URL"];
+  if (!raw || (raw.startsWith("${") && raw.endsWith("}"))) {
+    return "http://localhost:3111";
+  }
+  return raw;
+}
+
 function announceMode(handle: Handle): void {
   if (modeAnnounced) return;
   modeAnnounced = true;
@@ -40,8 +51,9 @@ function announceMode(handle: Handle): void {
       `[@agentmemory/mcp] proxying to agentmemory server at ${handle.baseUrl}\n`,
     );
   } else {
+    const fullToolCount = getAllTools().length;
     process.stderr.write(
-      `[@agentmemory/mcp] no server reachable at ${process.env["AGENTMEMORY_URL"] || "http://localhost:3111"}; falling back to local InMemoryKV\n`,
+      `[@agentmemory/mcp] no server reachable at ${displayAgentmemoryUrl()}; running reduced LOCAL FALLBACK with ${IMPLEMENTED_TOOLS.size} of ${fullToolCount} tools. Start 'npx @agentmemory/agentmemory' (and point AGENTMEMORY_URL at it) to unlock all ${fullToolCount} tools.\n`,
     );
   }
 }
@@ -89,6 +101,8 @@ interface Validated {
   files?: string[];
   query?: string;
   limit?: number;
+  format?: string;
+  tokenBudget?: number;
   memoryIds?: string[];
   reason?: string;
 }
@@ -118,6 +132,17 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       }
       v.query = query.trim();
       v.limit = parseLimit(args["limit"]);
+      const fmt = args["format"];
+      if (typeof fmt === "string" && fmt.trim()) {
+        v.format = fmt.trim().toLowerCase();
+      }
+      const budget = args["token_budget"];
+      if (typeof budget === "number" && Number.isFinite(budget) && budget > 0) {
+        v.tokenBudget = Math.floor(budget);
+      } else if (typeof budget === "string" && budget.trim()) {
+        const n = Number(budget);
+        if (Number.isFinite(n) && n > 0) v.tokenBudget = Math.floor(n);
+      }
       return v;
     }
     case "memory_sessions": {
@@ -159,11 +184,26 @@ async function handleProxy(
       });
       return textResponse(result);
     }
-    case "memory_recall":
+    case "memory_recall": {
+      const body: Record<string, unknown> = {
+        query: v.query,
+        limit: v.limit,
+        format: v.format ?? "full",
+      };
+      if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
+      const result = await handle.call("/agentmemory/search", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      return textResponse(result, true);
+    }
     case "memory_smart_search": {
+      const body: Record<string, unknown> = { query: v.query, limit: v.limit };
+      if (v.format != null) body["format"] = v.format;
+      if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
       const result = await handle.call("/agentmemory/smart-search", {
         method: "POST",
-        body: JSON.stringify({ query: v.query, limit: v.limit }),
+        body: JSON.stringify(body),
       });
       return textResponse(result, true);
     }
@@ -176,7 +216,7 @@ async function handleProxy(
     }
     case "memory_governance_delete": {
       const result = await handle.call("/agentmemory/governance/memories", {
-        method: "POST",
+        method: "DELETE",
         body: JSON.stringify({ memoryIds: v.memoryIds, reason: v.reason }),
       });
       return textResponse(result);
@@ -299,7 +339,7 @@ async function handleProxyGeneric(
   handle: ProxyHandle,
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
   // Forward to the server's full MCP surface so non-Claude clients can
-  // reach all 51 tools (lessons, sentinels, slots, signals, graph, …)
+  // reach all 53 tools (lessons, sentinels, slots, signals, graph, …)
   // instead of being capped at the 7 IMPLEMENTED_TOOLS set baked into
   // this shim. The server validates arguments per tool.
   const result = (await handle.call("/agentmemory/mcp/call", {
@@ -354,6 +394,57 @@ export async function handleToolCall(
   return handleLocal(validated, kvInstance);
 }
 
+export async function handleToolsList(): Promise<{ tools: unknown[] }> {
+  const debug = process.env["AGENTMEMORY_DEBUG"] === "1" || process.env["AGENTMEMORY_DEBUG"] === "true";
+  const handle = await resolveHandle();
+  announceMode(handle);
+  if (debug) {
+    process.stderr.write(
+      `[@agentmemory/mcp] tools/list: handle.mode=${handle.mode}${handle.mode === "proxy" ? ` baseUrl=${handle.baseUrl}` : ""}\n`,
+    );
+  }
+  if (handle.mode === "proxy") {
+    try {
+      const remote = (await handle.call("/agentmemory/mcp/tools", {
+        method: "GET",
+      })) as { tools?: unknown } | null;
+      if (debug) {
+        const shape = remote === null
+          ? "null"
+          : typeof remote !== "object"
+            ? typeof remote
+            : `keys=${Object.keys(remote as object).join(",")} toolsType=${Array.isArray((remote as { tools?: unknown }).tools) ? `array(len=${((remote as { tools: unknown[] }).tools).length})` : typeof (remote as { tools?: unknown }).tools}`;
+        process.stderr.write(
+          `[@agentmemory/mcp] tools/list: remote response shape: ${shape}\n`,
+        );
+      }
+      if (remote && Array.isArray(remote.tools)) {
+        if (debug) {
+          process.stderr.write(
+            `[@agentmemory/mcp] tools/list: returning ${remote.tools.length} tools from server\n`,
+          );
+        }
+        return { tools: remote.tools };
+      }
+      process.stderr.write(
+        `[@agentmemory/mcp] tools/list: server returned unexpected shape (no .tools array); falling back to local IMPLEMENTED_TOOLS list. Set AGENTMEMORY_DEBUG=1 to inspect response.\n`,
+      );
+    } catch (err) {
+      process.stderr.write(
+        `[@agentmemory/mcp] tools/list proxy failed: ${err instanceof Error ? err.message : String(err)}; falling back to local list\n`,
+      );
+      invalidateHandle();
+    }
+  }
+  const fallback = getAllTools().filter((t) => IMPLEMENTED_TOOLS.has(t.name));
+  if (debug) {
+    process.stderr.write(
+      `[@agentmemory/mcp] tools/list: returning ${fallback.length} local fallback tools (${fallback.map((t) => t.name).join(",")})\n`,
+    );
+  }
+  return { tools: fallback };
+}
+
 const transport = createStdioTransport(async (method, params) => {
   switch (method) {
     case "initialize":
@@ -369,32 +460,8 @@ const transport = createStdioTransport(async (method, params) => {
     case "notifications/initialized":
       return {};
 
-    case "tools/list": {
-      // When a server is reachable, expose every tool it advertises (51
-      // when AGENTMEMORY_TOOLS=all on the server). Without this, the shim
-      // capped non-Claude clients at the local 7-tool set even with the
-      // server up (issue #234).
-      const handle = await resolveHandle();
-      announceMode(handle);
-      if (handle.mode === "proxy") {
-        try {
-          const remote = (await handle.call("/agentmemory/mcp/tools", {
-            method: "GET",
-          })) as { tools?: unknown } | null;
-          if (remote && Array.isArray(remote.tools)) {
-            return { tools: remote.tools };
-          }
-        } catch (err) {
-          process.stderr.write(
-            `[@agentmemory/mcp] tools/list proxy failed: ${err instanceof Error ? err.message : String(err)}; falling back to local list\n`,
-          );
-          invalidateHandle();
-        }
-      }
-      return {
-        tools: getVisibleTools().filter((t) => IMPLEMENTED_TOOLS.has(t.name)),
-      };
-    }
+    case "tools/list":
+      return handleToolsList();
 
     case "tools/call": {
       const toolName = params.name as string;

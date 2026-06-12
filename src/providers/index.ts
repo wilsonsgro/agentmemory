@@ -7,6 +7,7 @@ import { AgentSDKProvider } from "./agent-sdk.js";
 import { AnthropicProvider } from "./anthropic.js";
 import { MinimaxProvider } from "./minimax.js";
 import { NoopProvider } from "./noop.js";
+import { OpenAIProvider } from "./openai.js";
 import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
@@ -22,6 +23,35 @@ function requireEnvVar(key: string): string {
     );
   }
   return value;
+}
+
+// #778: fallback providers used to inherit the primary provider's
+// model name (e.g. fallback Gemini was called with `gpt-4o-mini`),
+// 404'd every call, and tripped the circuit breaker — making
+// FALLBACK_PROVIDERS actively worse than no fallback. Each provider
+// must resolve its OWN env-driven default model. Mirrors the resolution
+// in detectProvider() so primary + fallback agree on what each
+// provider's default model is.
+function defaultModelFor(providerType: ProviderConfig["provider"]): string {
+  switch (providerType) {
+    case "openai":
+      return getEnvVar("OPENAI_MODEL") || "gpt-4o-mini";
+    case "anthropic":
+      return getEnvVar("ANTHROPIC_MODEL") || "claude-sonnet-4-20250514";
+    case "gemini":
+      return getEnvVar("GEMINI_MODEL") || "gemini-2.5-flash";
+    case "openrouter":
+      return (
+        getEnvVar("OPENROUTER_MODEL") || "anthropic/claude-sonnet-4-20250514"
+      );
+    case "minimax":
+      return getEnvVar("MINIMAX_MODEL") || "MiniMax-M2.7";
+    case "agent-sdk":
+      return "claude-sonnet-4-20250514";
+    case "noop":
+    default:
+      return "noop";
+  }
 }
 
 export function createProvider(config: ProviderConfig): ResilientProvider {
@@ -40,9 +70,14 @@ export function createFallbackProvider(
   for (const providerType of fallbackConfig.providers) {
     if (providerType === config.provider) continue;
     try {
+      // #778: resolve the fallback's OWN default model (or its env
+      // override) rather than copying config.model from the primary.
+      // Without this, FALLBACK_PROVIDERS=gemini on an OpenAI primary
+      // would call Gemini with `gpt-4o-mini`, get a 404 every time,
+      // and trip the circuit breaker.
       const fbConfig: ProviderConfig = {
         provider: providerType,
-        model: config.model,
+        model: defaultModelFor(providerType),
         maxTokens: config.maxTokens,
       };
       providers.push(createBaseProvider(fbConfig));
@@ -95,12 +130,17 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
         "https://openrouter.ai/api/v1/chat/completions",
       );
     case "openai": {
-      const baseURL = config.baseURL || requireEnvVar("OPENAI_BASE_URL");
-      return new OpenRouterProvider(
-        requireEnvVar("OPENAI_API_KEY"),
+      const openaiKey = getEnvVar("OPENAI_API_KEY");
+      if (!openaiKey) {
+        throw new Error(
+          "OPENAI_API_KEY is required for the openai provider",
+        );
+      }
+      return new OpenAIProvider(
+        openaiKey,
         config.model,
         config.maxTokens,
-        `${baseURL.replace(/\/$/, "")}/v1/chat/completions`,
+        config.baseURL,
       );
     }
     case "noop":

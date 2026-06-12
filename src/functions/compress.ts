@@ -15,7 +15,7 @@ import {
 } from "../prompts/compression.js";
 import { VISION_DESCRIPTION_PROMPT } from "../prompts/vision.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
-import { getSearchIndex } from "./search.js";
+import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreCompression } from "../eval/quality.js";
@@ -165,6 +165,7 @@ export function registerCompressFunction(
           ...(hasImage ? { modality: data.raw.modality } : {}),
           ...(imageDescription ? { imageDescription } : {}),
           ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
+          ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
         };
 
         await kv.set(
@@ -173,7 +174,23 @@ export function registerCompressFunction(
           compressed,
         );
 
-        getSearchIndex().add(compressed);
+        try {
+          getSearchIndex().add(compressed);
+        } catch (err) {
+          logger.warn("Failed to index compressed observation into BM25", {
+            obsId: compressed.id,
+            sessionId: compressed.sessionId,
+            title: compressed.title,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        await vectorIndexAddGuarded(
+          compressed.id,
+          compressed.sessionId,
+          compressed.title + " " + (compressed.narrative || ""),
+          { kind: "observation", logId: compressed.id },
+        );
 
         const streamResults = await Promise.allSettled([
           sdk.trigger({

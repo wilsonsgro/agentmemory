@@ -75,6 +75,98 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(body.results[0].id).toBe("m1");
   });
 
+  it("proxies memory_recall to POST /agentmemory/search and forwards format/token_budget (#507)", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      const body = init?.body ? JSON.parse(init.body as string) : undefined;
+      calls.push({ url, body });
+      if (url.endsWith("/agentmemory/search")) {
+        return new Response(
+          JSON.stringify({
+            mode: "full",
+            facts: [{ id: "m1" }],
+            narrative: "n",
+            concepts: ["c"],
+            files: ["f"],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const res = await handleToolCall("memory_recall", {
+      query: "auth bug",
+      limit: 5,
+      format: "full",
+      token_budget: 800,
+    });
+    const body = JSON.parse(res.content[0].text);
+    expect(body.mode).toBe("full");
+    expect(body.facts[0].id).toBe("m1");
+    const searchCall = calls.find((c) => c.url.endsWith("/agentmemory/search"));
+    expect(searchCall).toBeDefined();
+    expect(searchCall?.body).toEqual({
+      query: "auth bug",
+      limit: 5,
+      format: "full",
+      token_budget: 800,
+    });
+    expect(calls.find((c) => c.url.endsWith("/agentmemory/smart-search"))).toBeUndefined();
+  });
+
+  it("memory_recall defaults format to 'full' when omitted (#507)", async () => {
+    let recallBody: Record<string, unknown> | undefined;
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/search")) {
+        recallBody = init?.body ? JSON.parse(init.body as string) : undefined;
+        return new Response(JSON.stringify({ mode: "full", facts: [] }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    await handleToolCall("memory_recall", { query: "x" });
+    expect(recallBody?.["format"]).toBe("full");
+    expect(recallBody).not.toHaveProperty("token_budget");
+  });
+
+  it("proxies memory_governance_delete to the DELETE REST endpoint", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    installFetch((url, init) => {
+      const method = init?.method || "GET";
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      calls.push({
+        url,
+        method,
+        body: init?.body ? JSON.parse(init.body as string) : undefined,
+      });
+      if (url.endsWith("/agentmemory/governance/memories") && method === "DELETE") {
+        return new Response(JSON.stringify({ success: true, deleted: 2 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("method not allowed", { status: 405, statusText: "Method Not Allowed" });
+    });
+
+    const res = await handleToolCall("memory_governance_delete", {
+      memoryIds: "mem_1, mem_2",
+      reason: "cleanup stale test data",
+    });
+
+    expect(JSON.parse(res.content[0].text)).toEqual({ success: true, deleted: 2 });
+    expect(calls).toEqual([
+      {
+        url: `${BASE}/agentmemory/governance/memories`,
+        method: "DELETE",
+        body: {
+          memoryIds: ["mem_1", "mem_2"],
+          reason: "cleanup stale test data",
+        },
+      },
+    ]);
+  });
+
   it("local fallback returns the same shape as proxy for memory_smart_search", async () => {
     installFetch(() => {
       throw new Error("ECONNREFUSED");
@@ -196,5 +288,99 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
       String(url).endsWith("/agentmemory/remember"),
     );
     expect(remembersCalled).toBe(false);
+  });
+
+  it("AGENTMEMORY_FORCE_PROXY=1 skips livez probe and trusts the server", async () => {
+    process.env["AGENTMEMORY_FORCE_PROXY"] = "1";
+    const calls: string[] = [];
+    installFetch((url, init) => {
+      calls.push(url);
+      if (url.endsWith("/agentmemory/livez")) {
+        throw new Error("probe should be skipped");
+      }
+      if (url.endsWith("/agentmemory/remember")) {
+        return new Response(JSON.stringify({ id: "m-1", action: "created" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    try {
+      await handleToolCall("memory_save", { content: "force-proxy" });
+      expect(calls.some((u) => u.endsWith("/agentmemory/livez"))).toBe(false);
+      expect(calls.some((u) => u.endsWith("/agentmemory/remember"))).toBe(true);
+    } finally {
+      delete process.env["AGENTMEMORY_FORCE_PROXY"];
+    }
+  });
+
+  it("logs probe failure to stderr so sandboxed clients can diagnose silently dropped tools", async () => {
+    installFetch((url) => {
+      if (url.endsWith("/agentmemory/livez")) {
+        throw new Error("ECONNREFUSED 127.0.0.1:3111");
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const writes: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const localKv = new InMemoryKV(undefined);
+      await handleToolCall("memory_save", { content: "diag" }, localKv);
+    } finally {
+      process.stderr.write = origWrite;
+    }
+    const joined = writes.join("");
+    expect(joined).toMatch(/livez probe .* failed/);
+    expect(joined).toMatch(/AGENTMEMORY_FORCE_PROXY/);
+  });
+
+  it("local fallback tools/list returns all 7 IMPLEMENTED_TOOLS regardless of AGENTMEMORY_TOOLS env (#234)", async () => {
+    const { handleToolsList } = await import("../src/mcp/standalone.js");
+    installFetch(() => {
+      throw new Error("ECONNREFUSED");
+    });
+    delete process.env["AGENTMEMORY_TOOLS"];
+    const before = await handleToolsList();
+    const beforeTools = before.tools as Array<{ name: string }>;
+    expect(beforeTools.map((t) => t.name).sort()).toEqual([
+      "memory_audit",
+      "memory_export",
+      "memory_governance_delete",
+      "memory_recall",
+      "memory_save",
+      "memory_sessions",
+      "memory_smart_search",
+    ]);
+    expect(beforeTools).toHaveLength(7);
+
+    resetHandleForTests();
+    process.env["AGENTMEMORY_TOOLS"] = "core";
+    const core = await handleToolsList();
+    expect((core.tools as unknown[]).length).toBe(7);
+    delete process.env["AGENTMEMORY_TOOLS"];
+  });
+
+  it("AGENTMEMORY_PROBE_TIMEOUT_MS overrides the default probe timeout", async () => {
+    process.env["AGENTMEMORY_PROBE_TIMEOUT_MS"] = "50";
+    let probeStarted = 0;
+    installFetch((url) => {
+      if (url.endsWith("/agentmemory/livez")) {
+        probeStarted++;
+        return new Response("ok", { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    try {
+      const localKv = new InMemoryKV(undefined);
+      await handleToolCall("memory_save", { content: "timeout-knob" }, localKv);
+      expect(probeStarted).toBe(1);
+    } finally {
+      delete process.env["AGENTMEMORY_PROBE_TIMEOUT_MS"];
+    }
   });
 });
